@@ -31,7 +31,11 @@ async def check_availability(request: Request):
     if not token:
         return JSONResponse({"error": "Could not get access token"})
     
-    headers = {"Authorization": f"Bearer {token}"}
+    # Use Prefer header to get times directly in Eastern timezone
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Prefer": 'outlook.timezone="America/Toronto"'
+    }
     eastern = pytz.timezone("America/Toronto")
     now = datetime.now(eastern)
     
@@ -45,16 +49,17 @@ async def check_availability(request: Request):
         if len(available_slots) >= 6:  # Return max 6 slots
             break
             
-        start = check_date.replace(hour=0, minute=0, second=0).isoformat()
-        end = check_date.replace(hour=23, minute=59, second=59).isoformat()
+        # Use Eastern time for the query range
+        start = check_date.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = check_date.replace(hour=23, minute=59, second=59, microsecond=0)
         
         resp = requests.get(
             f"https://graph.microsoft.com/v1.0/users/{USER_EMAIL}/calendarView",
             headers=headers,
             params={
-                "startDateTime": start,
-                "endDateTime": end,
-                "$select": "subject,start,end"
+                "startDateTime": start.strftime("%Y-%m-%dT%H:%M:%S"),
+                "endDateTime": end.strftime("%Y-%m-%dT%H:%M:%S"),
+                "$select": "subject,start,end,showAs"
             }
         )
         
@@ -63,20 +68,33 @@ async def check_availability(request: Request):
             
         events = resp.json().get("value", [])
         
-        # Find free slots between 9 AM and 5 PM
+        # Find free slots between 9 AM and 5 PM Eastern
+        # Times from Graph are now already in Eastern (thanks to Prefer header)
         busy_times = []
         for event in events:
-            event_start = datetime.fromisoformat(event["start"]["dateTime"].replace("Z", "+00:00"))
-            event_end = datetime.fromisoformat(event["end"]["dateTime"].replace("Z", "+00:00"))
-            # Convert to Eastern
-            if event_start.tzinfo is None:
-                event_start = pytz.utc.localize(event_start)
-            if event_end.tzinfo is None:
-                event_end = pytz.utc.localize(event_end)
-            event_start_eastern = event_start.astimezone(eastern)
-            event_end_eastern = event_end.astimezone(eastern)
-            busy_times.append((event_start_eastern.hour * 60 + event_start_eastern.minute,
-                             event_end_eastern.hour * 60 + event_end_eastern.minute))
+            # Only block if showAs is busy, oof, or tentative
+            show_as = event.get("showAs", "busy")
+            if show_as == "free":
+                continue
+                
+            # Parse the time directly as Eastern (no conversion needed)
+            event_start_str = event["start"]["dateTime"][:16]  # "2026-05-08T10:00"
+            event_end_str = event["end"]["dateTime"][:16]
+            
+            try:
+                event_start_dt = datetime.strptime(event_start_str, "%Y-%m-%dT%H:%M")
+                event_end_dt = datetime.strptime(event_end_str, "%Y-%m-%dT%H:%M")
+            except ValueError:
+                continue
+            
+            start_minutes = event_start_dt.hour * 60 + event_start_dt.minute
+            end_minutes = event_end_dt.hour * 60 + event_end_dt.minute
+            
+            # Handle events that span midnight or are all-day
+            if end_minutes <= start_minutes:
+                end_minutes = 24 * 60  # treat as end of day
+            
+            busy_times.append((start_minutes, end_minutes))
         
         # Check each 30-min slot from 9 AM to 5 PM
         for hour in range(9, 17):
@@ -181,3 +199,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", "10000"))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
