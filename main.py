@@ -41,12 +41,17 @@ async def check_availability(request: Request):
     
     available_slots = []
     
-    # Check next 5 business days
-    for day_offset in range(1, 8):
+    # Check next 5 business days (all of them, not stopping early)
+    business_days_checked = 0
+    day_offset = 1
+    while business_days_checked < 5 and day_offset <= 14:
         check_date = now + timedelta(days=day_offset)
+        day_offset += 1
         if check_date.weekday() >= 5:  # Skip weekends
             continue
-        if len(available_slots) >= 6:  # Return max 6 slots
+        business_days_checked += 1
+        
+        if len(available_slots) >= 12:  # Return max 12 slots across all days
             break
             
         # Use Eastern time for the query range - MUST include timezone offset
@@ -75,31 +80,22 @@ async def check_availability(request: Request):
         events = resp.json().get("value", [])
         
         # Find free slots between 9 AM and 5 PM Eastern
-        # Times from Graph are now already in Eastern (thanks to Prefer header)
         busy_times = []
         for event in events:
-            # Only block if showAs is busy, oof, or tentative
             show_as = event.get("showAs", "busy")
             if show_as == "free":
                 continue
-                
-            # Parse the time directly as Eastern (no conversion needed)
-            event_start_str = event["start"]["dateTime"][:16]  # "2026-05-08T10:00"
+            event_start_str = event["start"]["dateTime"][:16]
             event_end_str = event["end"]["dateTime"][:16]
-            
             try:
                 event_start_dt = datetime.strptime(event_start_str, "%Y-%m-%dT%H:%M")
                 event_end_dt = datetime.strptime(event_end_str, "%Y-%m-%dT%H:%M")
             except ValueError:
                 continue
-            
             start_minutes = event_start_dt.hour * 60 + event_start_dt.minute
             end_minutes = event_end_dt.hour * 60 + event_end_dt.minute
-            
-            # Handle events that span midnight or are all-day
             if end_minutes <= start_minutes:
-                end_minutes = 24 * 60  # treat as end of day
-            
+                end_minutes = 24 * 60
             busy_times.append((start_minutes, end_minutes))
         
         # Check each 30-min slot from 9 AM to 5 PM
@@ -107,15 +103,12 @@ async def check_availability(request: Request):
             for minute in [0, 30]:
                 slot_start = hour * 60 + minute
                 slot_end = slot_start + 30
-                
-                # Check if slot conflicts with any busy time
                 is_free = True
                 for busy_start, busy_end in busy_times:
                     if slot_start < busy_end and slot_end > busy_start:
                         is_free = False
                         break
-                
-                if is_free and len(available_slots) < 6:
+                if is_free and len(available_slots) < 12:
                     day_name = check_date.strftime("%A")
                     date_str = check_date.strftime("%Y-%m-%d")
                     time_str = f"{hour:02d}:{minute:02d}"
@@ -129,7 +122,7 @@ async def check_availability(request: Request):
     
     return JSONResponse({
         "available_slots": available_slots,
-        "message": f"I have {len(available_slots)} available slots. Here are some options: " + 
+        "message": f"I have {len(available_slots)} available slots across the next 5 business days. Here are some options: " + 
                    ", ".join([s["display"] for s in available_slots[:3]])
     })
 
@@ -149,7 +142,7 @@ async def book_appointment(request: Request):
     if not token:
         return JSONResponse({"error": "Could not get access token"})
     
-    # VERIFY AVAILABILITY BEFORE BOOKING (safety net in case agent skips check_availability)
+    # VERIFY AVAILABILITY BEFORE BOOKING (safety net)
     check_headers = {
         "Authorization": f"Bearer {token}",
         "Prefer": 'outlook.timezone="America/Toronto"'
@@ -172,7 +165,6 @@ async def book_appointment(request: Request):
         hour, minute = map(int, time_str.split(":"))
         slot_start = hour * 60 + minute
         slot_end = slot_start + 15
-        
         for event in events:
             show_as = event.get("showAs", "busy")
             if show_as == "free":
@@ -195,11 +187,8 @@ async def book_appointment(request: Request):
                 })
     
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    
-    # Parse date and time
     hour, minute = map(int, time_str.split(":"))
     start_dt = f"{date}T{time_str}:00"
-    # End time = start + 15 minutes
     end_minute = minute + 15
     end_hour = hour
     if end_minute >= 60:
@@ -211,77 +200,38 @@ async def book_appointment(request: Request):
         "subject": f"Demo Call - {prospect_name} ({business_name})",
         "start": {"dateTime": start_dt, "timeZone": "America/Toronto"},
         "end": {"dateTime": end_dt, "timeZone": "America/Toronto"},
-        "body": {
-            "contentType": "HTML",
-            "content": f"<p>Demo call with {prospect_name} from {business_name}.</p><p>Email: {prospect_email}</p><p>Booked by AI Agent Alex.</p>"
-        },
-        "attendees": []
+        "body": {"contentType": "HTML", "content": f"<p>Demo call with {prospect_name} from {business_name}.</p><p>Email: {prospect_email}</p><p>Booked by AI Agent Alex.</p>"},
+        "attendees": [{"emailAddress": {"address": prospect_email, "name": prospect_name}, "type": "required"}] if prospect_email else []
     }
     
-    if prospect_email:
-        event_body["attendees"].append({
-            "emailAddress": {"address": prospect_email, "name": prospect_name},
-            "type": "required"
-        })
-    
-    resp = requests.post(
-        f"https://graph.microsoft.com/v1.0/users/{USER_EMAIL}/events",
-        headers=headers,
-        json=event_body
-    )
+    resp = requests.post(f"https://graph.microsoft.com/v1.0/users/{USER_EMAIL}/events", headers=headers, json=event_body)
     
     if resp.status_code in [200, 201]:
-        return JSONResponse({
-            "status": "success",
-            "message": f"Demo call booked for {date} at {time_str} Eastern with {prospect_name}. A calendar invite has been sent to {prospect_email}."
-        })
+        return JSONResponse({"status": "success", "message": f"Demo call booked for {date} at {time_str} Eastern with {prospect_name}. A calendar invite has been sent to {prospect_email}."})
     else:
         return JSONResponse({"error": f"Failed to create event: {resp.text[:200]}"})
 
 @app.get("/debug")
 async def debug():
-    """Debug endpoint to see what the server queries and receives"""
     token = get_access_token()
     eastern = pytz.timezone("America/Toronto")
     now = datetime.now(eastern)
-    check_date = now + timedelta(days=1)  # tomorrow
+    check_date = now + timedelta(days=1)
     start = check_date.replace(hour=0, minute=0, second=0, microsecond=0)
     end = check_date.replace(hour=23, minute=59, second=59, microsecond=0)
-    
     utc_offset = start.strftime("%z")
     offset_formatted = f"{utc_offset[:3]}:{utc_offset[3:]}"
-    
     start_param = f"{start.strftime('%Y-%m-%dT%H:%M:%S')}{offset_formatted}"
     end_param = f"{end.strftime('%Y-%m-%dT%H:%M:%S')}{offset_formatted}"
-    
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Prefer": 'outlook.timezone="America/Toronto"'
-    }
-    
-    resp = requests.get(
-        f"https://graph.microsoft.com/v1.0/users/{USER_EMAIL}/calendarView",
-        headers=headers,
-        params={
-            "startDateTime": start_param,
-            "endDateTime": end_param,
-            "$select": "subject,start,end,showAs"
-        }
-    )
-    
+    headers = {"Authorization": f"Bearer {token}", "Prefer": 'outlook.timezone="America/Toronto"'}
+    resp = requests.get(f"https://graph.microsoft.com/v1.0/users/{USER_EMAIL}/calendarView", headers=headers,
+        params={"startDateTime": start_param, "endDateTime": end_param, "$select": "subject,start,end,showAs", "$top": "50"})
     events = resp.json().get("value", []) if resp.status_code == 200 else []
-    
-    return {
-        "server_now": now.isoformat(),
-        "check_date": check_date.strftime("%Y-%m-%d %A"),
-        "utc_offset_raw": utc_offset,
-        "offset_formatted": offset_formatted,
-        "query_start": start_param,
-        "query_end": end_param,
-        "graph_status": resp.status_code,
-        "events_count": len(events),
-        "events": [{"subject": e["subject"], "start": e["start"]["dateTime"][:16], "end": e["end"]["dateTime"][:16], "showAs": e.get("showAs")} for e in events]
-    }
+    return {"server_now": now.isoformat(), "check_date": check_date.strftime("%Y-%m-%d %A"),
+            "utc_offset_raw": utc_offset, "offset_formatted": offset_formatted,
+            "query_start": start_param, "query_end": end_param, "graph_status": resp.status_code,
+            "events_count": len(events),
+            "events": [{"subject": e["subject"], "start": e["start"]["dateTime"][:16], "end": e["end"]["dateTime"][:16], "showAs": e.get("showAs")} for e in events]}
 
 @app.get("/health")
 async def health():
