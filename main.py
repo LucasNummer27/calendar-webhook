@@ -149,12 +149,57 @@ async def book_appointment(request: Request):
     if not token:
         return JSONResponse({"error": "Could not get access token"})
     
+    # VERIFY AVAILABILITY BEFORE BOOKING (safety net in case agent skips check_availability)
+    check_headers = {
+        "Authorization": f"Bearer {token}",
+        "Prefer": 'outlook.timezone="America/Toronto"'
+    }
+    eastern = pytz.timezone("America/Toronto")
+    check_resp = requests.get(
+        f"https://graph.microsoft.com/v1.0/users/{USER_EMAIL}/calendarView",
+        headers=check_headers,
+        params={
+            "startDateTime": f"{date}T00:00:00-04:00",
+            "endDateTime": f"{date}T23:59:59-04:00",
+            "$select": "subject,start,end,showAs",
+            "$top": "50",
+            "$orderby": "start/dateTime"
+        }
+    )
+    
+    if check_resp.status_code == 200:
+        events = check_resp.json().get("value", [])
+        hour, minute = map(int, time_str.split(":"))
+        slot_start = hour * 60 + minute
+        slot_end = slot_start + 15
+        
+        for event in events:
+            show_as = event.get("showAs", "busy")
+            if show_as == "free":
+                continue
+            event_start_str = event["start"]["dateTime"][:16]
+            event_end_str = event["end"]["dateTime"][:16]
+            try:
+                event_start_dt = datetime.strptime(event_start_str, "%Y-%m-%dT%H:%M")
+                event_end_dt = datetime.strptime(event_end_str, "%Y-%m-%dT%H:%M")
+            except ValueError:
+                continue
+            ev_start = event_start_dt.hour * 60 + event_start_dt.minute
+            ev_end = event_end_dt.hour * 60 + event_end_dt.minute
+            if ev_end <= ev_start:
+                ev_end = 24 * 60
+            if slot_start < ev_end and slot_end > ev_start:
+                return JSONResponse({
+                    "status": "conflict",
+                    "message": f"Sorry, {date} at {time_str} is not available. There is already a calendar event ({event.get('subject', 'busy')}) at that time. Please call check_availability to get available slots."
+                })
+    
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     
     # Parse date and time
+    hour, minute = map(int, time_str.split(":"))
     start_dt = f"{date}T{time_str}:00"
     # End time = start + 15 minutes
-    hour, minute = map(int, time_str.split(":"))
     end_minute = minute + 15
     end_hour = hour
     if end_minute >= 60:
@@ -220,9 +265,7 @@ async def debug():
         params={
             "startDateTime": start_param,
             "endDateTime": end_param,
-            "$select": "subject,start,end,showAs",
-            "$top": "50",
-            "$orderby": "start/dateTime"
+            "$select": "subject,start,end,showAs"
         }
     )
     
