@@ -63,7 +63,9 @@ async def check_availability(request: Request):
             params={
                 "startDateTime": f"{start.strftime('%Y-%m-%dT%H:%M:%S')}{offset_formatted}",
                 "endDateTime": f"{end.strftime('%Y-%m-%dT%H:%M:%S')}{offset_formatted}",
-                "$select": "subject,start,end,showAs"
+                "$select": "subject,start,end,showAs",
+                "$top": "50",
+                "$orderby": "start/dateTime"
             }
         )
         
@@ -218,7 +220,9 @@ async def debug():
         params={
             "startDateTime": start_param,
             "endDateTime": end_param,
-            "$select": "subject,start,end,showAs"
+            "$select": "subject,start,end,showAs",
+            "$top": "50",
+            "$orderby": "start/dateTime"
         }
     )
     
